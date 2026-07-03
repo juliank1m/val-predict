@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup, Tag
 from sqlalchemy import text
+from sqlalchemy.exc import ResourceClosedError
 from sqlalchemy.orm import Session
 
 from app.database import SyncSessionLocal
@@ -456,7 +457,7 @@ def _extract_players(soup: BeautifulSoup, match: dict, games: list[dict]) -> lis
 
                 pid = None
                 if link:
-                    pid_match = re.search(r"/player/(\d+)/", link.get("href", ""))
+                    pid_match = re.search(r"/player/(\d+)(?:/|$|[?#])", link.get("href", ""))
                     pid = int(pid_match.group(1)) if pid_match else None
 
                 stat_cells = tr.select("td.mod-stat")
@@ -586,6 +587,15 @@ def _insert_match_data(
         ))
 
     for p in players:
+        if p.get("player_id") is None:
+            logger.warning(
+                "Skipping player stats without a VLR player ID: match=%s map=%s player=%r",
+                p.get("match_id"),
+                p.get("game_id"),
+                p.get("player_name"),
+            )
+            continue
+
         team_id = _get_or_create_team(session, p.get("team_name"), team_cache)
         pid = _get_or_create_player(session, p.get("player_id"), p["player_name"], player_cache)
 
@@ -845,6 +855,7 @@ def scrape_recent_matches(pages: int = 3, cancel_check: callable = None) -> int:
                     cancel_check()
                 # Scrape match detail for games + player stats
                 logger.info("Scraping match %d: %s vs %s", match["match_id"], match["team1"], match["team2"])
+                savepoint = db.begin_nested()
                 try:
                     detail_soup = _fetch(http, match["match_url"])
                     games = _extract_games(detail_soup, match)
@@ -906,12 +917,37 @@ def scrape_recent_matches(pages: int = 3, cancel_check: callable = None) -> int:
                                 for r in _extract_rounds(panel, g, t1_id, t2_id):
                                     db.add(Round(**r))
 
+                    # Flush every object for this match before releasing its
+                    # savepoint. A malformed match must not poison the outer
+                    # transaction or prevent later matches from being saved.
+                    savepoint.commit()
                     existing_ids.add(match["match_id"])
                     new_count += 1
 
                     # Be polite
                     time.sleep(1)
                 except Exception:
+                    try:
+                        savepoint.rollback()
+                    except ResourceClosedError:
+                        # A successfully released savepoint cannot be rolled
+                        # back. This only matters if a later bookkeeping step
+                        # raises after the database work has succeeded.
+                        pass
+
+                    # Cache entries may have been added inside the rolled-back
+                    # savepoint. Rebuild them so later matches never refer to
+                    # team/player rows that no longer exist.
+                    team_cache.clear()
+                    team_cache.update({
+                        row[1]: row[0]
+                        for row in db.execute(text("SELECT id, name FROM teams")).fetchall()
+                    })
+                    player_cache.clear()
+                    player_cache.update({
+                        row[0]: True
+                        for row in db.execute(text("SELECT id FROM players")).fetchall()
+                    })
                     logger.exception("Failed to scrape match %d", match["match_id"])
                     continue
 
